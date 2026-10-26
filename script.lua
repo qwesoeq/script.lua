@@ -14,7 +14,22 @@ local me = Players.LocalPlayer
 -- ║   ТВОЙ FIREBASE URL                      ║
 -- ╚══════════════════════════════════════════╝
 local BACKEND_URL = "https://femboyhubchat-default-rtdb.firebaseio.com"
-local httpFn = request or http_request or (syn and syn.request) or (http and http.request)
+
+-- Правильное определение HTTP-функции (некоторые инжекторы отдают userdata вместо функции)
+local httpFn
+if typeof(request) == "function" then
+    httpFn = request
+elseif typeof(http_request) == "function" then
+    httpFn = http_request
+elseif syn and typeof(syn.request) == "function" then
+    httpFn = syn.request
+elseif http and typeof(http.request) == "function" then
+    httpFn = http.request
+end
+
+if not httpFn then
+    warn("[Femboy Hub] HTTP-функция не найдена. Users/Chat работать не будут.")
+end
 
 local function safeEncode(t) local s,r = pcall(function() return HttpService:JSONEncode(t) end) return s and r or "{}" end
 local function safeDecode(t) local s,r = pcall(function() return HttpService:JSONDecode(t) end) return s and r or {} end
@@ -45,6 +60,7 @@ local chineseHatEnabled = false
 local antiAFK = false
 local chineseHatId = 6201695834
 local cameraClipEnabled = false
+local candyFarmEnabled = false
 
 local function saveConfig()
     if writefile then
@@ -117,6 +133,8 @@ local FLY_SPEED              = 50
 local HITBOX_SIZE            = 15
 local KILLAURA_RADIUS        = 8
 local KILLAURA_COOLDOWN      = 0.2
+local CANDY_TELEPORT_DELAY   = 0.2
+local CANDY_SEARCH_RADIUS    = 600
 
 -- ==== Морфы / Утилиты ====
 local HEADLESS_MESH_ID = "rbxassetid://1095708"
@@ -132,7 +150,7 @@ local autoClickDot        = nil
 local originalQueries     = {}
 
 local optimizeBtn, autoClickBtn, hatBtn, headlessBtn, korbloxBtn
-local keyEspBtn, keyEspBtn2, espBtn, cameraClipBtn
+local keyEspBtn, keyEspBtn2, espBtn, cameraClipBtn, candyBtn
 
 -- ==== Сетевые переменные ====
 local chatMessages = {}
@@ -155,6 +173,7 @@ local isTeleporting = false
 local lastFarmTeleport = 0
 local farmTeleportAttempts = 0
 local walkToPortalMode = false
+local lastCandyTeleport = 0
 
 -- ==== Палитра ====
 local COLORS = {
@@ -213,7 +232,6 @@ local function getAlive(player)
     return char, hum, root
 end
 
--- Строгий фильтр: только настоящие боевые персонажи (не клоны, не боты, не спектаторы)
 local function getRealTarget(p)
     if not p or p == me then return end
     if not p.Parent or p.Parent ~= Players then return end
@@ -222,35 +240,24 @@ local function getRealTarget(p)
     if not char or not char.Parent then return end
     if char.Parent ~= workspace then return end
 
-    -- ГЛАВНАЯ ПРОВЕРКА: персонаж должен совпадать с тем, что мы запомнили
-    -- через CharacterAdded. Если игра подменила Character напрямую на клон —
-    -- сравнение не сойдётся и цель отсекается.
     if realCharacters[p] ~= char then return end
-
-    -- Обратная привязка должна указывать именно на этого игрока
     if Players:GetPlayerFromCharacter(char) ~= p then return end
-
-    -- Имя модели персонажа должно совпадать с ником игрока
     if char.Name ~= p.Name then return end
-
-    -- Настоящий персонаж всегда имеет скрипт Animate
     if not char:FindFirstChild("Animate") then return end
 
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum then return end
     if hum.Health <= 0 then return end
-    if hum.MaxHealth == math.huge then return end  -- у ботов/дафф часто бесконечное HP
+    if hum.MaxHealth == math.huge then return end
     if hum:GetState() == Enum.HumanoidStateType.Dead then return end
 
     local root = char:FindFirstChild("HumanoidRootPart")
     if not root then return end
     if not root:FindFirstChildOfClass("Motor6D") then return end
 
-    -- Атрибуты спектатора
     if p:GetAttribute("Spectating") or p:GetAttribute("IsSpectator") or p:GetAttribute("Spectator") or p:GetAttribute("Dead") then return end
     if char:GetAttribute("Spectating") or char:GetAttribute("IsSpectator") or char:GetAttribute("Spectator") then return end
 
-    -- Команда спектаторов / мёртвых
     if p.Team then
         local tn = string.lower(p.Team.Name)
         if tn:find("spectat") or tn:find("dead") or tn:find("ghost") or tn:find("observ") then return end
@@ -337,40 +344,80 @@ local function refreshTags()
     end
 end
 
-local function apiReq(url, method, body)
-    if not httpFn then return end
-    local ok, r = pcall(function() return httpFn({Url = url, Method = method, Headers = {["Content-Type"] = "application/json"}, Body = body}) end)
-    if ok and r then return r.Body or r.body end
-end
-
 local function sendPresence()
     if not httpFn then return end
-    apiReq(BACKEND_URL .. "/presence/" .. me.UserId .. ".json", "PUT", safeEncode({userId = me.UserId, name = me.Name, displayName = me.DisplayName, placeId = game.PlaceId, jobId = game.JobId, lastSeen = os.time()}))
+    local body = safeEncode({
+        userId = me.UserId, name = me.Name, displayName = me.DisplayName,
+        placeId = game.PlaceId, jobId = game.JobId, lastSeen = os.time()
+    })
+    local ok, r = pcall(function()
+        return httpFn({
+            Url = BACKEND_URL .. "/presence/" .. me.UserId .. ".json",
+            Method = "PUT",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = body
+        })
+    end)
+    if not ok then
+        warn("[Presence] Ошибка запроса: " .. tostring(r))
+    elseif r and r.StatusCode and r.StatusCode >= 400 then
+        warn("[Presence] Firebase ответил кодом " .. tostring(r.StatusCode))
+    end
 end
 
 local function fetchUsers()
     if not httpFn then return end
-    local b = apiReq(BACKEND_URL .. "/presence.json", "GET")
-    if not b then return end
-    local d = safeDecode(b)
+    local ok, r = pcall(function()
+        return httpFn({Url = BACKEND_URL .. "/presence.json", Method = "GET"})
+    end)
+    if not ok or not r or not r.Body then return end
+    local d = safeDecode(r.Body)
+    if type(d) ~= "table" then return end
     local n = os.time()
     local f = {}
-    for uid, i in pairs(d) do if type(i) == "table" and i.lastSeen and (n - i.lastSeen) < 120 then f[tostring(uid)] = i end end
+    for uid, i in pairs(d) do
+        if type(i) == "table" and i.lastSeen and (n - i.lastSeen) < 120 then
+            f[tostring(uid)] = i
+        end
+    end
     activeUsers = f
 end
 
 local function sendChat(txt)
     if not httpFn or txt == "" then return end
-    apiReq(BACKEND_URL .. "/chat.json", "POST", safeEncode({userId = me.UserId, name = me.Name, displayName = me.DisplayName, text = txt, time = os.time()}))
+    local body = safeEncode({
+        userId = me.UserId, name = me.Name, displayName = me.DisplayName,
+        text = txt, time = os.time()
+    })
+    local ok, r = pcall(function()
+        return httpFn({
+            Url = BACKEND_URL .. "/chat.json",
+            Method = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = body
+        })
+    end)
+    if not ok then
+        warn("[Chat] Ошибка отправки: " .. tostring(r))
+    elseif r and r.StatusCode and r.StatusCode >= 400 then
+        warn("[Chat] Firebase ответил кодом " .. tostring(r.StatusCode))
+    end
 end
 
 local function fetchChat()
     if not httpFn then return end
-    local b = apiReq(BACKEND_URL .. "/chat.json", "GET")
-    if not b then return end
-    local d = safeDecode(b)
+    local ok, r = pcall(function()
+        return httpFn({Url = BACKEND_URL .. "/chat.json", Method = "GET"})
+    end)
+    if not ok or not r or not r.Body then return end
+    local d = safeDecode(r.Body)
+    if type(d) ~= "table" then return end
     local m = {}
-    for _, x in pairs(d) do if type(x) == "table" and x.text and x.time then table.insert(m, x) end end
+    for _, x in pairs(d) do
+        if type(x) == "table" and x.text and x.time then
+            table.insert(m, x)
+        end
+    end
     table.sort(m, function(a, b) return a.time < b.time end)
     while #m > 50 do table.remove(m, 1) end
     chatMessages = m
@@ -381,7 +428,7 @@ end
 -- ==========================================
 local function toggleCameraClip()
     cameraClipEnabled = not cameraClipEnabled
-    
+
     if cameraClipEnabled then
         task.spawn(function()
             for _, v in ipairs(workspace:GetDescendants()) do
@@ -398,7 +445,7 @@ local function toggleCameraClip()
                         end
                         parent = parent.Parent
                     end
-                    
+
                     if not isPlayerPart then
                         originalQueries[v] = true
                         v.CanQuery = false
@@ -418,7 +465,7 @@ local function toggleCameraClip()
         end)
         setBadgeLog("Camera Clip OFF")
     end
-    
+
     if cameraClipBtn then
         cameraClipBtn.Text = "Camera Clip: " .. (cameraClipEnabled and "ON" or "OFF")
         cameraClipBtn.BackgroundColor3 = cameraClipEnabled and COLORS.green or COLORS.activeTab
@@ -568,7 +615,7 @@ local function toggleOptimization()
             end
         end)
     end
-    
+
     if optimizeBtn then
         optimizeBtn.Text = "Optimize: " .. (optimizationEnabled and "ON" or "OFF")
         optimizeBtn.BackgroundColor3 = optimizationEnabled and COLORS.green or COLORS.activeTab
@@ -589,15 +636,15 @@ local function createClickDot()
     autoClickDot.BorderSizePixel = 2
     autoClickDot.BorderColor3 = Color3.new(1, 1, 1)
     autoClickDot.AnchorPoint = Vector2.new(0.5, 0.5)
-    
+
     if autoClickX == 0 and autoClickY == 0 then
         autoClickX = workspace.CurrentCamera.ViewportSize.X / 2
         autoClickY = workspace.CurrentCamera.ViewportSize.Y / 2
     end
     autoClickDot.Position = UDim2.new(0, autoClickX, 0, autoClickY)
-    
+
     autoClickDot.Parent = gethui and gethui() or game:GetService("CoreGui")
-    
+
     local dragging, dragStart, startPos
     autoClickDot.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -609,7 +656,7 @@ local function createClickDot()
             end)
         end
     end)
-    
+
     UserInputService.InputChanged:Connect(function(input)
         if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
@@ -659,7 +706,7 @@ local function toggleAutoClicker()
         if autoClickDot then autoClickDot:Destroy(); autoClickDot = nil end
         stopAutoClicker()
     end
-    
+
     if autoClickBtn then
         autoClickBtn.Text = "Auto Click: " .. (autoClickEnabled and "ON" or "OFF")
         autoClickBtn.BackgroundColor3 = autoClickEnabled and COLORS.green or COLORS.activeTab
@@ -684,7 +731,7 @@ end
 
 local function toggleChineseHat()
     chineseHatEnabled = not chineseHatEnabled
-    
+
     if chineseHatEnabled then
         local model = loadHat(chineseHatId)
         if model then
@@ -708,7 +755,7 @@ local function toggleChineseHat()
             end
         end
     end
-    
+
     if hatBtn then
         hatBtn.Text = "Chinese Hat: " .. (chineseHatEnabled and "ON" or "OFF")
         hatBtn.BackgroundColor3 = chineseHatEnabled and COLORS.accent or COLORS.activeTab
@@ -811,6 +858,62 @@ local function updateWalkFarm()
         end
     else
         stuckTimer = 0
+    end
+end
+
+-- ==========================================
+-- 🍬 CANDY FARM
+-- ==========================================
+local function findNearestCandy(myRoot)
+    if not myRoot then return nil end
+    local bestPart, bestDist = nil, math.huge
+    local myPos = myRoot.Position
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Parent then
+            local name = string.lower(obj.Name)
+            if name:find("candy") and not name:find("candycane") then
+                local part = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart")
+                if part and part.Parent then
+                    local isPlayerPart = false
+                    local p = part.Parent
+                    while p do
+                        if p:IsA("Model") and Players:GetPlayerFromCharacter(p) then
+                            isPlayerPart = true
+                            break
+                        end
+                        p = p.Parent
+                    end
+                    if not isPlayerPart then
+                        local d = (part.Position - myPos).Magnitude
+                        if d < bestDist and d <= CANDY_SEARCH_RADIUS then
+                            bestDist = d
+                            bestPart = part
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bestPart
+end
+
+local function updateCandyFarm()
+    if not candyFarmEnabled then return end
+    local _, hum, root = getAlive(me)
+    if not hum or not root then return end
+
+    local now = tick()
+    if now - lastCandyTeleport < CANDY_TELEPORT_DELAY then return end
+
+    local candy = findNearestCandy(root)
+    if candy then
+        lastCandyTeleport = now
+        isTeleporting = true
+        pcall(function()
+            root.CFrame = candy.CFrame + Vector3.new(0, 3, 0)
+        end)
+        task.delay(0.1, function() isTeleporting = false end)
     end
 end
 
@@ -1338,6 +1441,7 @@ local function buildUI()
     local pageMisc    = createPage("Misc")
     local pageFling   = createPage("Fling")
     local pageESP     = createPage("ESP")
+    local pageCandy   = createPage("Candy")
 
     local statusLbl = Instance.new("TextLabel")
     statusLbl.Size = UDim2.new(1, 0, 0, 30)
@@ -1721,11 +1825,55 @@ local function buildUI()
     Instance.new("UICorner", miscLog).CornerRadius = UDim.new(0, 4)
     table.insert(logLabels, miscLog)
 
+    -- CANDY
+    local candyTitle = Instance.new("TextLabel")
+    candyTitle.Size = UDim2.new(1, 0, 0, 20)
+    candyTitle.BackgroundTransparency = 1
+    candyTitle.Text = "🍬 Candy Farm"
+    candyTitle.TextColor3 = COLORS.text
+    candyTitle.Font = Enum.Font.GothamBold
+    candyTitle.TextSize = 13
+    candyTitle.TextXAlignment = Enum.TextXAlignment.Left
+    candyTitle.Parent = pageCandy
+
+    local candyDesc = Instance.new("TextLabel")
+    candyDesc.Size = UDim2.new(1, 0, 0, 40)
+    candyDesc.Position = UDim2.new(0, 0, 0, 25)
+    candyDesc.BackgroundTransparency = 1
+    candyDesc.Text = "Автоматически телепортируется к каждой падающей конфете. Работает во время события Конфетный Фарм."
+    candyDesc.TextColor3 = COLORS.textDim
+    candyDesc.Font = Enum.Font.Gotham
+    candyDesc.TextSize = 10
+    candyDesc.TextXAlignment = Enum.TextXAlignment.Left
+    candyDesc.TextWrapped = true
+    candyDesc.Parent = pageCandy
+
+    candyBtn = createBtn("Candy Farm: " .. (candyFarmEnabled and "ON" or "OFF"), pageCandy, 75)
+    candyBtn.BackgroundColor3 = candyFarmEnabled and COLORS.green or COLORS.activeTab
+    candyBtn.MouseButton1Click:Connect(function()
+        candyFarmEnabled = not candyFarmEnabled
+        candyBtn.Text = "Candy Farm: " .. (candyFarmEnabled and "ON" or "OFF")
+        candyBtn.BackgroundColor3 = candyFarmEnabled and COLORS.green or COLORS.activeTab
+    end)
+
+    local candyLog = Instance.new("TextLabel")
+    candyLog.Size = UDim2.new(1, -10, 0, 40)
+    candyLog.Position = UDim2.new(0, 0, 0, 130)
+    candyLog.BackgroundColor3 = COLORS.sidebar
+    candyLog.Text = "Готов к сбору конфет"
+    candyLog.TextColor3 = COLORS.textDim
+    candyLog.Font = Enum.Font.Gotham
+    candyLog.TextSize = 10
+    candyLog.TextXAlignment = Enum.TextXAlignment.Left
+    candyLog.TextWrapped = true
+    candyLog.Parent = pageCandy
+    Instance.new("UICorner", candyLog).CornerRadius = UDim.new(0, 4)
+
     -- CHAT
     local chatHeader = Instance.new("Frame", pageChat)
     chatHeader.Size = UDim2.new(1, -10, 0, 45); chatHeader.BackgroundColor3 = COLORS.bg; chatHeader.BorderSizePixel = 0
     Instance.new("UICorner", chatHeader).CornerRadius = UDim.new(0, 6)
-    
+
     local chatIcon = Instance.new("Frame", chatHeader)
     chatIcon.Size = UDim2.new(0, 32, 0, 32); chatIcon.Position = UDim2.new(0, 8, 0, 6); chatIcon.BackgroundColor3 = COLORS.pulse
     Instance.new("UICorner", chatIcon).CornerRadius = UDim.new(0, 6)
@@ -1746,22 +1894,22 @@ local function buildUI()
     local inputBg = Instance.new("Frame", pageChat)
     inputBg.Size = UDim2.new(1, -10, 0, 36); inputBg.Position = UDim2.new(0, 0, 0, 280); inputBg.BackgroundColor3 = COLORS.msgBg
     Instance.new("UICorner", inputBg).CornerRadius = UDim.new(1, 0)
-    
+
     local chatInput = Instance.new("TextBox", inputBg); chatInput.Size = UDim2.new(1, -50, 1, 0); chatInput.Position = UDim2.new(0, 15, 0, 0); chatInput.BackgroundTransparency = 1; chatInput.Text = ""; chatInput.PlaceholderText = "Message..."; chatInput.TextColor3 = COLORS.text; chatInput.Font = Enum.Font.Gotham; chatInput.TextSize = 12; chatInput.ClearTextOnFocus = false; chatInput.TextXAlignment = Enum.TextXAlignment.Left
-    
+
     local sendBtn = Instance.new("TextButton", inputBg); sendBtn.Size = UDim2.new(0, 30, 0, 30); sendBtn.Position = UDim2.new(1, -34, 0, 3); sendBtn.BackgroundColor3 = COLORS.pulse; sendBtn.Text = ">"; sendBtn.TextColor3 = Color3.new(1,1,1); sendBtn.Font = Enum.Font.GothamBold; sendBtn.TextSize = 14
     Instance.new("UICorner", sendBtn).CornerRadius = UDim.new(1, 0)
 
     local function renderChat()
         for _, c in ipairs(chatScroll:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
         onlineLbl.Text = tostring(#chatMessages) .. " messages"
-        
+
         for i, msg in ipairs(chatMessages) do
             local card = Instance.new("Frame", chatScroll)
             card.Size = UDim2.new(1, -5, 0, 60); card.BackgroundColor3 = COLORS.msgBg; card.BorderSizePixel = 0
             Instance.new("UICorner", card).CornerRadius = UDim.new(0, 8)
             card.AutomaticSize = Enum.AutomaticSize.Y
-            
+
             local avatar = Instance.new("ImageLabel", card)
             avatar.Size = UDim2.new(0, 36, 0, 36); avatar.Position = UDim2.new(0, 8, 0, 8); avatar.BackgroundColor3 = COLORS.activeTab
             avatar.Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(msg.userId) .. "&w=150&h=150"
@@ -1771,7 +1919,7 @@ local function buildUI()
             nameLbl.Size = UDim2.new(1, -60, 0, 16); nameLbl.Position = UDim2.new(0, 52, 0, 8); nameLbl.BackgroundTransparency = 1
             nameLbl.Text = msg.displayName or msg.name; nameLbl.TextColor3 = (msg.userId == me.UserId) and COLORS.pulse or COLORS.blue
             nameLbl.Font = Enum.Font.GothamBold; nameLbl.TextSize = 12; nameLbl.TextXAlignment = Enum.TextXAlignment.Left
-            
+
             local tagLbl = Instance.new("TextLabel", card)
             tagLbl.Size = UDim2.new(0, 100, 0, 16); tagLbl.Position = UDim2.new(1, -110, 0, 8); tagLbl.BackgroundTransparency = 1
             tagLbl.Text = "@" .. msg.name; tagLbl.TextColor3 = COLORS.textDim; tagLbl.Font = Enum.Font.Gotham; tagLbl.TextSize = 10; tagLbl.TextXAlignment = Enum.TextXAlignment.Right
@@ -1779,11 +1927,11 @@ local function buildUI()
             local msgLbl = Instance.new("TextLabel", card)
             msgLbl.Size = UDim2.new(1, -60, 0, 0); msgLbl.Position = UDim2.new(0, 52, 0, 26); msgLbl.BackgroundTransparency = 1
             msgLbl.Text = msg.text; msgLbl.TextColor3 = COLORS.text; msgLbl.Font = Enum.Font.Gotham; msgLbl.TextSize = 12; msgLbl.TextXAlignment = Enum.TextXAlignment.Left; msgLbl.TextWrapped = true; msgLbl.AutomaticSize = Enum.AutomaticSize.Y
-            
+
             local timeLbl = Instance.new("TextLabel", card)
             timeLbl.Size = UDim2.new(0, 50, 0, 12); timeLbl.Position = UDim2.new(1, -55, 0, 26); timeLbl.BackgroundTransparency = 1
             timeLbl.Text = os.date("%H:%M", msg.time); timeLbl.TextColor3 = COLORS.textDim; timeLbl.Font = Enum.Font.Gotham; timeLbl.TextSize = 10; timeLbl.TextXAlignment = Enum.TextXAlignment.Right
-            
+
             local padding = Instance.new("UIPadding", card); padding.PaddingBottom = UDim.new(0, 8)
         end
 
@@ -1812,7 +1960,7 @@ local function buildUI()
 
     local function renderUsers()
         for _, c in ipairs(usersScroll:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
-        
+
         local count = 0
         for _ in pairs(activeUsers) do count = count + 1 end
         usersHeader.Text = "Femboy Users: " .. count .. " online"
@@ -1821,14 +1969,14 @@ local function buildUI()
             local row = Instance.new("Frame", usersScroll)
             row.Size = UDim2.new(1, -5, 0, 40); row.BackgroundColor3 = COLORS.msgBg
             Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
-            
+
             local av = Instance.new("ImageLabel", row)
             av.Size = UDim2.new(0, 28, 0, 28); av.Position = UDim2.new(0, 6, 0, 6); av.BackgroundColor3 = COLORS.activeTab
             av.Image = "rbxthumb://type=AvatarHeadShot&id=" .. uid .. "&w=150&h=150"
             Instance.new("UICorner", av).CornerRadius = UDim.new(1, 0)
 
             local n = Instance.new("TextLabel", row); n.Size = UDim2.new(1, -110, 1, 0); n.Position = UDim2.new(0, 42, 0, 0); n.BackgroundTransparency = 1; n.Text = info.displayName or info.name; n.TextColor3 = COLORS.text; n.Font = Enum.Font.GothamBold; n.TextSize = 12; n.TextXAlignment = Enum.TextXAlignment.Left
-            
+
             if tostring(uid) ~= tostring(me.UserId) then
                 local j = Instance.new("TextButton", row); j.Size = UDim2.new(0, 60, 0, 24); j.Position = UDim2.new(1, -64, 0, 8); j.BackgroundColor3 = COLORS.accent; j.Text = "Join"; j.TextSize = 11; j.TextColor3 = Color3.new(1,1,1); j.Font = Enum.Font.GothamBold
                 Instance.new("UICorner", j).CornerRadius = UDim.new(0, 4)
@@ -1851,12 +1999,13 @@ local function buildUI()
     local tBadges  = createTab("Teleports", "🌌", 89, "Badges")
     local tFake    = createTab("Fake", "💀", 117, "Fake")
     local tMisc    = createTab("Misc", "⚡", 145, "Misc")
-    local tChat    = createTab("Chat", "💬", 173, "Chat")
-    local tUsers   = createTab("Users", "👥", 201, "Users")
-    local tFling   = createTab("Fling", "✈️", 229, "Fling")
-    local tESP     = createTab("ESP", "👁️", 257, "ESP")
+    local tCandy   = createTab("Candy", "🍬", 173, "Candy")
+    local tChat    = createTab("Chat", "💬", 201, "Chat")
+    local tUsers   = createTab("Users", "👥", 229, "Users")
+    local tFling   = createTab("Fling", "✈️", 257, "Fling")
+    local tESP     = createTab("ESP", "👁️", 285, "ESP")
 
-    local tabs = {tMain, tPlayer, tCombat, tBadges, tFake, tMisc, tChat, tUsers, tFling, tESP}
+    local tabs = {tMain, tPlayer, tCombat, tBadges, tFake, tMisc, tCandy, tChat, tUsers, tFling, tESP}
     local activeTab = nil
     local function switchTab(tab)
         if activeTab then
@@ -2100,6 +2249,7 @@ while true do
     end
 
     if killAuraEnabled then runKillAura() end
+    if candyFarmEnabled then updateCandyFarm() end
 
     if httpFn then
         if (tick() - lastPresenceSend) > 15 then
@@ -2217,7 +2367,9 @@ while true do
     if espEnabled then updateESP() end
 
     if statusLabel then
-        if killAuraEnabled then
+        if candyFarmEnabled then
+            statusLabel.Text = "Status: Candy Farm Active!"
+        elseif killAuraEnabled then
             statusLabel.Text = "Status: Kill Aura Active!"
         elseif not (farming or walkFarmEnabled) then
             statusLabel.Text = "Status: Farm OFF"
